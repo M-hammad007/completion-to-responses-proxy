@@ -25,7 +25,7 @@ HEADERS = {
 
 
 def messages_to_prompt(messages: list) -> str:
-    """Convert messages list to a single prompt string."""
+    """Convert OpenAI-style messages list to a single prompt string."""
     parts = []
     for m in messages:
         role = m.get("role", "user")
@@ -54,148 +54,177 @@ def list_models():
 @app.route("/v1/chat/completions", methods=["POST"])
 @app.route("/v1/messages", methods=["POST"])
 def chat_completions():
-    body       = request.get_json(force=True)
-    raw_model  = body.get("model", "gpt-6.1-sol")
-    
-    # Map Claude model names to gpt-6.1-sol so AgentRouter accepts them
-    if raw_model.startswith("claude") or raw_model.startswith("anthropic/"):
-        model = "gpt-6.1-sol"
-    else:
-        model = raw_model
-        
-    messages   = body.get("messages", [])
-    
-    # Handle Anthropic system prompt format
-    system_prompt = body.get("system", "")
-    if system_prompt:
-        if isinstance(system_prompt, list):
-            system_prompt = " ".join(c.get("text", "") for c in system_prompt if c.get("type") == "text")
-        messages = [{"role": "system", "content": system_prompt}] + messages
-        
-    stream     = body.get("stream", False)
-    max_tokens = body.get("max_tokens", 16000)
-
-    prompt = messages_to_prompt(messages)
-
-    payload = {
-        "model":             model,
-        "input":             prompt,
-        "max_output_tokens": max(max_tokens, 8000),  # ensure enough room for reasoning
-        "stream":            stream,
-    }
-
-    upstream = requests.post(
-        f"{AGENTROUTER_BASE}/responses",
-        headers=HEADERS,
-        json=payload,
-        stream=stream,
-        timeout=120,
-    )
-
-    # ── Non-streaming ──────────────────────────────────────────────────────────
-    if not stream:
-        if upstream.status_code != 200:
-            return Response(upstream.content, status=upstream.status_code,
-                            content_type="application/json")
-
-        data = upstream.json()
-        reply_text = ""
-        for out in data.get("output", []):
-            if out.get("type") == "message":
-                for c in out.get("content", []):
-                    if c.get("type") == "output_text":
-                        reply_text += c.get("text", "")
-
+    try:
         is_anthropic = (request.path == "/v1/messages")
-        if is_anthropic:
+        body       = request.get_json(force=True)
+        raw_model  = body.get("model", "gpt-6.1-sol")
+        
+        # Map Claude model names to gpt-6.1-sol so AgentRouter accepts them
+        if raw_model.startswith("claude") or raw_model.startswith("anthropic/"):
+            model = "gpt-6.1-sol"
+        else:
+            model = raw_model
+            
+        messages   = body.get("messages", [])
+        
+        # Handle Anthropic system prompt format
+        system_prompt = body.get("system", "")
+        if system_prompt:
+            if isinstance(system_prompt, list):
+                system_prompt = " ".join(c.get("text", "") for c in system_prompt if c.get("type") == "text")
+            messages = [{"role": "system", "content": system_prompt}] + messages
+            
+        stream     = body.get("stream", False)
+        max_tokens = body.get("max_tokens") or 16000
+
+        prompt = messages_to_prompt(messages)
+
+        payload = {
+            "model":             model,
+            "input":             prompt,
+            "max_output_tokens": max(max_tokens, 8000),
+            "stream":            stream,
+        }
+
+        upstream = requests.post(
+            f"{AGENTROUTER_BASE}/responses",
+            headers=HEADERS,
+            json=payload,
+            stream=stream,
+            timeout=120,
+        )
+
+        # ── Non-streaming ──────────────────────────────────────────────────────────
+        if not stream:
+            if upstream.status_code != 200:
+                return Response(upstream.content, status=upstream.status_code,
+                                content_type="application/json")
+
+            data = upstream.json()
+            reply_text = ""
+            for out in data.get("output", []):
+                if out.get("type") == "message":
+                    for c in out.get("content", []):
+                        if c.get("type") == "output_text":
+                            reply_text += c.get("text", "")
+
+            if is_anthropic:
+                return jsonify({
+                    "id":          data.get("id", "msg-proxy"),
+                    "type":        "message",
+                    "role":        "assistant",
+                    "model":       raw_model,
+                    "content":     [{"type": "text", "text": reply_text}],
+                    "stop_reason": "end_turn",
+                    "usage": {
+                        "input_tokens":  data.get("usage", {}).get("input_tokens", 0),
+                        "output_tokens": data.get("usage", {}).get("output_tokens", 0),
+                    }
+                })
+
             return jsonify({
-                "id":          data.get("id", "msg-proxy"),
-                "type":        "message",
-                "role":        "assistant",
-                "model":       raw_model,
-                "content":     [{"type": "text", "text": reply_text}],
-                "stop_reason": "end_turn",
-                "usage": {
-                    "input_tokens":  data.get("usage", {}).get("input_tokens", 0),
-                    "output_tokens": data.get("usage", {}).get("output_tokens", 0),
-                }
+                "id":      data.get("id", "chatcmpl-proxy"),
+                "object":  "chat.completion",
+                "model":   raw_model,
+                "choices": [{
+                    "index":         0,
+                    "message":       {"role": "assistant", "content": reply_text},
+                    "finish_reason": "stop",
+                }],
+                "usage": data.get("usage", {}),
             })
 
-        return jsonify({
-            "id":      data.get("id", "chatcmpl-proxy"),
-            "object":  "chat.completion",
-            "model":   raw_model,
-            "choices": [{
-                "index":         0,
-                "message":       {"role": "assistant", "content": reply_text},
-                "finish_reason": "stop",
-            }],
-            "usage": data.get("usage", {}),
-        })
+        # ── Streaming ──────────────────────────────────────────────────────────────
+        def generate():
+            chunk_id = f"msg_{os.urandom(8).hex()}"
 
-    # ── Streaming ──────────────────────────────────────────────────────────────
-    def generate():
-        chunk_id = "stream-proxy"
-        is_anthropic = (request.path == "/v1/messages")
-
-        if is_anthropic:
-            yield f"event: message_start\ndata: {json.dumps({'type':'message_start','message':{'id':'msg-stream','type':'message','role':'assistant','model':raw_model,'content':[],'stop_reason':None,'usage':{'input_tokens':10,'output_tokens':1}}})}\n\n"
-            yield f"event: content_block_start\ndata: {json.dumps({'type':'content_block_start','index':0,'content_block':{'type':'text','text':''}})}\n\n"
-
-        for raw_line in upstream.iter_lines(decode_unicode=True):
-            if not raw_line or not raw_line.startswith("data:"):
-                continue
-
-            data_str = raw_line[5:].strip()
-            if data_str == "[DONE]":
-                if not is_anthropic:
-                    yield "data: [DONE]\n\n"
-                return
-
-            try:
-                ev = json.loads(data_str)
-            except json.JSONDecodeError:
-                continue
-
-            ev_type = ev.get("type", "")
-
-            # Text delta
-            if ev_type == "response.output_text.delta":
-                delta = ev.get("delta", "")
-                if is_anthropic:
-                    yield f"event: content_block_delta\ndata: {json.dumps({'type':'content_block_delta','index':0,'delta':{'type':'text_delta','text':delta}})}\n\n"
-                else:
-                    chunk = {
-                        "id":      chunk_id,
-                        "object":  "chat.completion.chunk",
-                        "model":   raw_model,
-                        "choices": [{
-                            "index":  0,
-                            "delta":  {"role": "assistant", "content": delta},
-                            "finish_reason": None,
-                        }],
+            if is_anthropic:
+                # 1. Start message
+                msg_init = {
+                    "type": "message_start",
+                    "message": {
+                        "id": chunk_id,
+                        "type": "message",
+                        "role": "assistant",
+                        "model": raw_model,
+                        "content": [],
+                        "stop_reason": None,
+                        "stop_sequence": None,
+                        "usage": {"input_tokens": 15, "output_tokens": 1}
                     }
-                    yield f"data: {json.dumps(chunk)}\n\n"
+                }
+                yield f"event: message_start\ndata: {json.dumps(msg_init)}\n\n"
+                
+                # 2. Start text content block
+                yield f"event: content_block_start\ndata: {json.dumps({'type':'content_block_start','index':0,'content_block':{'type':'text','text':''}})}\n\n"
+                
+                # 3. Initial ping to acknowledge connection immediately
+                yield f"event: ping\ndata: {json.dumps({'type':'ping'})}\n\n"
 
-            # Terminal events
-            elif ev_type in ("response.completed", "response.incomplete", "response.failed"):
-                if is_anthropic:
-                    yield f"event: content_block_stop\ndata: {json.dumps({'type':'content_block_stop','index':0})}\n\n"
-                    yield f"event: message_delta\ndata: {json.dumps({'type':'message_delta','delta':{'stop_reason':'end_turn'},'usage':{'output_tokens':100}})}\n\n"
-                    yield f"event: message_stop\ndata: {json.dumps({'type':'message_stop'})}\n\n"
-                else:
-                    chunk = {
-                        "id":      chunk_id,
-                        "object":  "chat.completion.chunk",
-                        "model":   raw_model,
-                        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-                    }
-                    yield f"data: {json.dumps(chunk)}\n\n"
-                    yield "data: [DONE]\n\n"
-                return
+            for raw_line in upstream.iter_lines(decode_unicode=True):
+                if not raw_line or not raw_line.startswith("data:"):
+                    continue
 
-    return Response(generate(), content_type="text/event-stream",
-                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+                data_str = raw_line[5:].strip()
+                if data_str == "[DONE]":
+                    if not is_anthropic:
+                        yield "data: [DONE]\n\n"
+                    return
+
+                try:
+                    ev = json.loads(data_str)
+                except json.JSONDecodeError:
+                    continue
+
+                ev_type = ev.get("type", "")
+
+                # While reasoning is in progress, keep connection active with pings so Claude doesn't freeze
+                if "reasoning" in ev_type or ev_type in ("response.in_progress", "response.output_item.added"):
+                    if is_anthropic:
+                        yield f"event: ping\ndata: {json.dumps({'type':'ping'})}\n\n"
+                    continue
+
+                # Text delta
+                if ev_type == "response.output_text.delta":
+                    delta = ev.get("delta", "")
+                    if is_anthropic:
+                        yield f"event: content_block_delta\ndata: {json.dumps({'type':'content_block_delta','index':0,'delta':{'type':'text_delta','text':delta}})}\n\n"
+                    else:
+                        chunk = {
+                            "id":      chunk_id,
+                            "object":  "chat.completion.chunk",
+                            "model":   raw_model,
+                            "choices": [{
+                                "index":  0,
+                                "delta":  {"role": "assistant", "content": delta},
+                                "finish_reason": None,
+                            }],
+                        }
+                        yield f"data: {json.dumps(chunk)}\n\n"
+
+                # Terminal events
+                elif ev_type in ("response.completed", "response.incomplete", "response.failed"):
+                    if is_anthropic:
+                        yield f"event: content_block_stop\ndata: {json.dumps({'type':'content_block_stop','index':0})}\n\n"
+                        yield f"event: message_delta\ndata: {json.dumps({'type':'message_delta','delta':{'stop_reason':'end_turn'},'usage':{'output_tokens':250}})}\n\n"
+                        yield f"event: message_stop\ndata: {json.dumps({'type':'message_stop'})}\n\n"
+                    else:
+                        chunk = {
+                            "id":      chunk_id,
+                            "object":  "chat.completion.chunk",
+                            "model":   raw_model,
+                            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                        }
+                        yield f"data: {json.dumps(chunk)}\n\n"
+                        yield "data: [DONE]\n\n"
+                    return
+
+        return Response(generate(), content_type="text/event-stream",
+                        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+    except Exception as err:
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": str(err), "trace": traceback.format_exc()}), 500
 
 
 if __name__ == "__main__":
